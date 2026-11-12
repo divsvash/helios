@@ -37,14 +37,14 @@ python3 -m helios.cli --db ./helios.db show <session_id>
 
 ## What this proves
 
-- Time-window diffing, not commit-range diffing: fully uncommitted
-  work is captured correctly.
-- Untracked files (created but never `git add`-ed) are detected
-  explicitly — a commit-based `git diff` never shows these at all,
-  and git even collapses new untracked directories to a single line
-  by default (`git status --porcelain -uall` is required to see the
-  individual files; this tripped the first version of this code and
-  is fixed in baseline.py).
+- A content-addressed filesystem observation is captured at both session
+  boundaries. The primary change report compares those two observed states,
+  not a baseline Git commit to the final working tree. This includes tracked,
+  untracked, and pre-existing-dirty files without attributing their T0 state
+  to the session.
+- The JSON record includes a typed evidence graph. Its nodes and edges carry
+  provenance such as `Helios filesystem comparison`, `Git history`, or
+  `Helios command execution`; it does not infer causality or agent ownership.
 - Checks are run independently by Helios at both start and end —
   never trusted from the agent's own claim of having run them.
 - Every report has an explicit DISCLOSURE section stating what this
@@ -54,6 +54,6 @@ python3 -m helios.cli --db ./helios.db show <session_id>
 ## What's deliberately not here
 
 No comparison across sessions, no scoring, no AI reasoning layer, no
-process launching, no agent integration. The evidence record (JSON)
-is the artifact those would eventually consume — not designed yet,
-on purpose.
+process launching, no agent integration, and no vector/semantic matching.
+The evidence record (JSON) is the artifact those would eventually consume —
+not designed yet, on purpose.

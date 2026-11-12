@@ -1,7 +1,10 @@
-"""Deterministic git-state facts. No inference lives here."""
+"""Directly observed repository facts. No inference lives here."""
 
+import hashlib
+import os
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 
@@ -21,6 +24,8 @@ class GitSnapshot:
     dirty: bool
     tracked_dirty_files: list = field(default_factory=list)
     untracked_files: list = field(default_factory=list)
+    filesystem_files: dict = field(default_factory=dict)
+    filesystem_unobserved_paths: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -29,14 +34,58 @@ class GitSnapshot:
             "dirty": self.dirty,
             "tracked_dirty_files": self.tracked_dirty_files,
             "untracked_files": self.untracked_files,
+            "filesystem_files": self.filesystem_files,
+            "filesystem_unobserved_paths": self.filesystem_unobserved_paths,
         }
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def filesystem_manifest(repo_path: str) -> tuple[dict, list]:
+    """Observe every readable regular file below the repository root.
+
+    This is deliberately independent of Git.  A session boundary must compare
+    what was on disk at start and end, including files Git does not track.
+    Each observation is content-addressed so mtime never masquerades as a
+    change.  The .git directory is repository metadata, not project state.
+    """
+    root = Path(repo_path).resolve()
+    files = {}
+    unobserved_paths = []
+    for directory, subdirs, names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        subdirs[:] = [name for name in subdirs if name != ".git"]
+        for name in names:
+            path = directory_path / name
+            try:
+                if not path.is_file() or path.is_symlink():
+                    continue
+                stat = path.stat()
+                relative = path.relative_to(root).as_posix()
+                files[relative] = {"sha256": _sha256(path), "size_bytes": stat.st_size}
+            except (OSError, PermissionError):
+                # A fact collector must not fabricate a file observation when
+                # the file could not be read. Its absence is handled as an
+                # explicit disclosure by the evidence layer.
+                try:
+                    unobserved_paths.append(path.relative_to(root).as_posix())
+                except ValueError:
+                    unobserved_paths.append(str(path))
+                continue
+    return files, sorted(unobserved_paths)
+
+
 def snapshot(repo_path: str) -> GitSnapshot:
-    """Capture the current, verifiable git state of a repository.
+    """Capture the current, verifiable repository state.
 
     This does not interpret anything. It is a fact-only read of what
-    `git` itself already knows.
+    `git` itself knows, plus a content-addressed filesystem manifest.
 
     Untracked files are separated out deliberately: `git diff` against
     a commit never shows untracked files' content, so a file an agent
@@ -56,13 +105,36 @@ def snapshot(repo_path: str) -> GitSnapshot:
             untracked_files.append(path)
         else:
             tracked_dirty_files.append(path)
+    files, unobserved_paths = filesystem_manifest(repo_path)
     return GitSnapshot(
         commit=commit,
         branch=branch,
         dirty=bool(status_lines),
         tracked_dirty_files=tracked_dirty_files,
         untracked_files=untracked_files,
+        filesystem_files=files,
+        filesystem_unobserved_paths=unobserved_paths,
     )
+
+
+def filesystem_changes(baseline_files: dict, final_files: dict) -> list:
+    """Return content-addressed file changes between two observations.
+
+    These are the primary changes for a Helios session.  They are based on
+    states Helios observed at the asserted time boundaries, not on commit
+    ancestry or Git tracking status.
+    """
+    changes = []
+    for path in sorted(set(baseline_files) | set(final_files)):
+        before = baseline_files.get(path)
+        after = final_files.get(path)
+        if before is None:
+            changes.append({"path": path, "status": "created", "before": None, "after": after})
+        elif after is None:
+            changes.append({"path": path, "status": "deleted", "before": before, "after": None})
+        elif before["sha256"] != after["sha256"]:
+            changes.append({"path": path, "status": "modified", "before": before, "after": after})
+    return changes
 
 
 def diff_stat(repo_path: str, baseline_commit: Optional[str]) -> dict:

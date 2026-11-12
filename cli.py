@@ -49,6 +49,13 @@ def cmd_end(args):
         "SELECT baseline_json, created_at FROM sessions WHERE id = ?", (session_id,)
     ).fetchone()
     baseline_dict = json.loads(row[0])
+    if "filesystem_files" not in baseline_dict:
+        print(
+            "This session predates filesystem-boundary capture and cannot be "
+            "reconstructed truthfully. Start a new session.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     started_at = row[1]
     base_snapshot = baseline.GitSnapshot(
         commit=baseline_dict["commit"],
@@ -56,6 +63,8 @@ def cmd_end(args):
         dirty=baseline_dict["dirty"],
         tracked_dirty_files=baseline_dict["tracked_dirty_files"],
         untracked_files=baseline_dict["untracked_files"],
+        filesystem_files=baseline_dict["filesystem_files"],
+        filesystem_unobserved_paths=baseline_dict.get("filesystem_unobserved_paths", []),
     )
     checks_before = session["checks_before"]
 

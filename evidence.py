@@ -36,23 +36,42 @@ def build_evidence(
     checks_before: list,
     checks_after: list,
 ) -> dict:
-    diff = baseline.diff_stat(repo_path, baseline_snapshot.commit)
-    tracked_changed = baseline.changed_files(repo_path, baseline_snapshot.commit)
+    filesystem_changes = baseline.filesystem_changes(
+        baseline_snapshot.filesystem_files, final_snapshot.filesystem_files
+    )
     commits = baseline.commits_since(repo_path, baseline_snapshot.commit)
-
-    new_untracked = baseline.new_untracked_files(
-        baseline_snapshot.untracked_files, final_snapshot.untracked_files
-    )
-    removed_untracked = baseline.removed_untracked_files(
-        baseline_snapshot.untracked_files, final_snapshot.untracked_files
-    )
-
-    all_changed_paths = (
-        {f["path"] for f in tracked_changed} | set(new_untracked) | set(removed_untracked)
-    )
+    all_changed_paths = {change["path"] for change in filesystem_changes}
     dependency_manifests_touched = sorted(
         p for p in all_changed_paths if p.split("/")[-1] in baseline.KNOWN_DEPENDENCY_MANIFESTS
     )
+
+    graph = build_evidence_graph(
+        session_id=session_id,
+        filesystem_changes=filesystem_changes,
+        commits=commits,
+        checks_before=checks_before,
+        checks_after=checks_after,
+    )
+
+    disclosure = [
+        "Helios observed filesystem state at the start and end of this "
+        "developer-asserted window. The file changes report is a net "
+        "comparison of those observations, not a Git commit diff.",
+        "Any intermediate iteration -- failed attempts, reverts, "
+        "back-and-forth -- is invisible unless it left a distinct trace "
+        "in git history within this window (e.g. an intermediate commit).",
+        "Check results reflect the repository at the moment Helios ran "
+        "them (start and end), not any point in between.",
+    ]
+    unobserved = sorted(
+        set(baseline_snapshot.filesystem_unobserved_paths)
+        | set(final_snapshot.filesystem_unobserved_paths)
+    )
+    if unobserved:
+        disclosure.append(
+            "Helios could not read these filesystem paths at one or both "
+            f"boundaries, so it cannot make a change claim about them: {', '.join(unobserved)}"
+        )
 
     return {
         "session_id": session_id,
@@ -66,11 +85,12 @@ def build_evidence(
         "facts": {
             "baseline": baseline_snapshot.to_dict(),
             "final": final_snapshot.to_dict(),
-            "diff_stat": diff,
-            "tracked_files_changed": tracked_changed,
-            "untracked_files_created": new_untracked,
-            "untracked_files_removed": removed_untracked,
-            "commits": commits,
+            "filesystem_changes": filesystem_changes,
+            "git": {
+                "commits_observed": commits,
+                "baseline": baseline_snapshot.to_dict(),
+                "final": final_snapshot.to_dict(),
+            },
             "dependency_manifests_touched": dependency_manifests_touched,
             "checks": {
                 "before": checks_before,
@@ -78,16 +98,61 @@ def build_evidence(
             },
             "left_uncommitted": final_snapshot.dirty or bool(final_snapshot.untracked_files),
         },
-        "disclosure": [
-            "Helios was not present while work happened; only the state at "
-            "start and the state at end are known.",
-            "Any intermediate iteration -- failed attempts, reverts, "
-            "back-and-forth -- is invisible unless it left a distinct trace "
-            "in git history within this window (e.g. an intermediate commit).",
-            "Check results reflect the repository at the moment Helios ran "
-            "them (start and end), not any point in between.",
-        ],
+        "evidence_graph": graph,
+        "disclosure": disclosure,
     }
+
+
+def build_evidence_graph(
+    session_id: str,
+    filesystem_changes: list,
+    commits: list,
+    checks_before: list,
+    checks_after: list,
+) -> dict:
+    """Represent directly observed evidence and its provenance.
+
+    The graph intentionally records facts and their sources only. It does not
+    rank implementations, infer causality, or claim that an observed file
+    change was made by a particular agent.
+    """
+    start_state_id = f"state:{session_id}:start"
+    end_state_id = f"state:{session_id}:end"
+    nodes = [
+        {"id": f"attempt:{session_id}", "type": "attempt", "provenance": "developer assertion"},
+        {"id": start_state_id, "type": "repository_state", "provenance": "Helios filesystem and Git observation at start"},
+        {"id": end_state_id, "type": "repository_state", "provenance": "Helios filesystem and Git observation at end"},
+    ]
+    edges = [
+        {"from": f"attempt:{session_id}", "to": start_state_id, "type": "starts_from", "provenance": "developer-bounded window"},
+        {"from": f"attempt:{session_id}", "to": end_state_id, "type": "ends_at", "provenance": "developer-bounded window"},
+    ]
+
+    for index, change in enumerate(filesystem_changes):
+        node_id = f"file-change:{index}"
+        nodes.append({
+            "id": node_id,
+            "type": "file_change",
+            "path": change["path"],
+            "status": change["status"],
+            "provenance": "Helios filesystem comparison",
+        })
+        edges.append({"from": f"attempt:{session_id}", "to": node_id, "type": "observed_change", "provenance": "Helios filesystem comparison"})
+        edges.append({"from": start_state_id, "to": node_id, "type": "before_state", "provenance": "Helios filesystem observation"})
+        edges.append({"from": node_id, "to": end_state_id, "type": "after_state", "provenance": "Helios filesystem observation"})
+
+    for commit in commits:
+        node_id = f"commit:{commit['sha']}"
+        nodes.append({"id": node_id, "type": "git_commit", "sha": commit["sha"], "provenance": "Git history"})
+        edges.append({"from": f"attempt:{session_id}", "to": node_id, "type": "observed_commit", "provenance": "Git history since starting HEAD"})
+
+    for phase, checks in (("before", checks_before), ("after", checks_after)):
+        for index, check in enumerate(checks):
+            node_id = f"check:{phase}:{index}"
+            nodes.append({"id": node_id, "type": "check_run", "phase": phase, "passed": check["passed"], "provenance": "Helios command execution"})
+            edges.append({"from": f"attempt:{session_id}", "to": node_id, "type": "independently_verified_by", "provenance": "Helios command execution"})
+
+    return {"nodes": nodes, "edges": edges}
 
 
 def render_report(evidence: dict) -> str:
@@ -109,32 +174,21 @@ def render_report(evidence: dict) -> str:
     lines.append("")
 
     lines.append("FACTS")
-    ds = f["diff_stat"]
+    changes = f["filesystem_changes"]
     lines.append(
-        f"  {ds['files_changed']} tracked file(s) changed via git "
-        f"(+{ds['insertions']}/-{ds['deletions']} lines)"
+        f"  {len(changes)} file(s) changed between Helios's start and end "
+        "filesystem observations"
     )
-    if f["tracked_files_changed"]:
-        for entry in f["tracked_files_changed"]:
-            lines.append(f"    {entry['path']:<40} {entry['status']}")
+    for change in changes:
+        lines.append(f"    {change['path']:<40} {change['status']}")
 
-    if f["untracked_files_created"]:
-        lines.append(
-            f"  {len(f['untracked_files_created'])} new untracked file(s) "
-            f"(not visible to a commit-based diff):"
-        )
-        for p in f["untracked_files_created"]:
-            lines.append(f"    {p:<40} created (untracked)")
-    if f["untracked_files_removed"]:
-        for p in f["untracked_files_removed"]:
-            lines.append(f"    {p:<40} removed (was untracked)")
-
-    if f["commits"]:
-        lines.append(f"  {len(f['commits'])} commit(s) made in this window:")
-        for commit in f["commits"]:
+    commits = f["git"]["commits_observed"]
+    if commits:
+        lines.append(f"  {len(commits)} Git commit(s) observed after starting HEAD:")
+        for commit in commits:
             lines.append(f"    {commit['sha'][:8]}  {commit['message']}")
     else:
-        lines.append("  0 commits made in this window")
+        lines.append("  0 Git commits observed after starting HEAD")
 
     lines.append(
         f"  working tree at end: "
@@ -165,5 +219,10 @@ def render_report(evidence: dict) -> str:
     lines.append("DISCLOSURE (what this record does NOT establish)")
     for d in evidence["disclosure"]:
         lines.append(f"  - {d}")
+
+    graph = evidence["evidence_graph"]
+    lines.append("")
+    lines.append("EVIDENCE GRAPH")
+    lines.append(f"  {len(graph['nodes'])} typed evidence node(s), {len(graph['edges'])} provenance edge(s)")
 
     return "\n".join(lines)
