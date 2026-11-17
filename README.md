@@ -1,4 +1,6 @@
-v=# Helios — single-attempt evidence primitive (P0)
+Helios captures evidence around a developer-defined coding session. It records content-addressed filesystem snapshots, Git history and independently executed checks, while explicitly documenting what those observations cannot establish.
+
+ single-attempt evidence primitive (P0)
 
 Frozen scope: this is only the primitive. No comparison, no LLM
 evaluator, no agent launching/integration. Those come later, once
